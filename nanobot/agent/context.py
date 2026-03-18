@@ -2,6 +2,7 @@
 
 import base64
 import mimetypes
+import os
 import platform
 from pathlib import Path
 from typing import Any
@@ -72,9 +73,13 @@ Skills with available="false" need dependencies installed first - you can try in
 - Use file tools when they are simpler or more reliable than shell commands.
 """
 
-        return f"""# nanobot 🐈
+        # Allow Spoek deployments to override the bot identity via env var
+        bot_name = os.environ.get("SPOEK_NAME") or "nanobot"
+        emoji = "👻" if os.environ.get("SPOEK_NAME") else "🐈"
 
-You are nanobot, a helpful AI assistant.
+        return f"""# {bot_name} {emoji}
+
+You are {bot_name}, a personal AI assistant.
 
 ## Runtime
 {runtime}

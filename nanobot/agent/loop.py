@@ -308,6 +308,17 @@ class AgentLoop:
 
         asyncio.create_task(_do_restart())
 
+    async def _fire_activity(self, spoek_id: str, api_base: str) -> None:
+        """Notify the Spoek control plane that this Spoek had activity (best-effort)."""
+        import httpx
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    f"{api_base}/internal/activity/{spoek_id}", timeout=5.0
+                )
+        except Exception:
+            pass  # Activity tracking is non-critical; never raise here
+
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message under the global lock."""
         async with self._processing_lock:
@@ -315,6 +326,13 @@ class AgentLoop:
                 response = await self._process_message(msg)
                 if response is not None:
                     await self.bus.publish_outbound(response)
+                    # Spoek: fire activity hook after each successful agent turn
+                    spoek_id = os.environ.get("SPOEK_ID")
+                    api_base = os.environ.get("API_BASE_URL")
+                    if spoek_id and api_base and msg.channel != "system":
+                        self._schedule_background(
+                            self._fire_activity(spoek_id, api_base)
+                        )
                 elif msg.channel == "cli":
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
