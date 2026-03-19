@@ -126,7 +126,7 @@ class SpoekHttpChannel(BaseChannel):
         request_id = msg.metadata.get("_request_id")
         if not request_id:
             # Unsolicited push (e.g. cron): deliver via pushUrl if configured.
-            push_url = self.config.get("pushUrl")
+            push_url = self.config.push_url
             if push_url and msg.chat_id and msg.content:
                 try:
                     async with httpx.AsyncClient() as client:
