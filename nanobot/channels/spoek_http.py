@@ -43,6 +43,7 @@ class SpoekHttpConfig:
         self.tcp_port: int = int(config.get("tcpPort", 18791))
         self.allow_from: list[str] = config.get("allowFrom", ["*"])
         self.timeout: float = float(config.get("timeout", 60.0))
+        self.push_url: str | None = config.get("pushUrl")
 
 
 class SpoekHttpChannel(BaseChannel):
@@ -132,6 +133,22 @@ class SpoekHttpChannel(BaseChannel):
                 logger.warning(
                     "spoek_http: callback failed for request_id={}: {}", request_id, exc
                 )
+            return
+
+        if not request_id:
+            # Unsolicited push (e.g. cron): deliver via pushUrl if configured.
+            if self.config.push_url and msg.chat_id and msg.content:
+                try:
+                    async with httpx.AsyncClient() as client:
+                        await client.post(
+                            self.config.push_url,
+                            json={"chat_id": msg.chat_id, "text": msg.content},
+                            timeout=10.0,
+                        )
+                except Exception as exc:
+                    logger.warning("spoek_http: push failed for chat_id={}: {}", msg.chat_id, exc)
+            else:
+                logger.warning("spoek_http: no pushUrl configured, dropping unsolicited message for chat_id={}", msg.chat_id)
             return
 
         # Sync mode: resolve the pending Future so the blocked HTTP handler returns.
