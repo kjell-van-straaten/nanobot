@@ -1,13 +1,22 @@
-"""Spoek HTTP channel — receives messages via Unix socket, returns responses synchronously.
+"""Spoek HTTP channel — receives messages via Unix socket or TCP, returns responses.
 
 This channel replaces nanobot's native per-bot Telegram integration for the Spoek
 deployment model, where one shared @SpoekBot handles all groups and the FastAPI
 dispatcher routes messages to per-Spoek nanobot processes via Unix socket.
 
-Flow:
-    FastAPI dispatcher  →  POST /message (Unix socket)
-                        ←  {"response": "..."}
+Two modes:
+
+Synchronous (default):
+    FastAPI dispatcher  →  POST /message (no callback_url)
+                        ←  200 {"response": "..."}  (blocks until agent finishes)
                         →  send reply via shared Telegram bot token
+
+Async/callback (fire-and-forget):
+    FastAPI dispatcher  →  POST /message + callback_url
+                        ←  202 {"request_id": "..."}  (returns immediately)
+                           … agent processes in background …
+                        →  POST callback_url {"request_id": "...", "response": "..."}
+                        →  FastAPI dispatcher sends reply via Telegram
 """
 
 from __future__ import annotations
@@ -19,6 +28,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import httpx
 from loguru import logger
 
 from nanobot.bus.events import OutboundMessage
@@ -96,8 +106,9 @@ class SpoekHttpChannel(BaseChannel):
     async def send(self, msg: OutboundMessage) -> None:
         """Called by ChannelManager when the agent has a final response.
 
-        Progress/streaming messages are silently dropped — we only resolve the
-        waiting HTTP request on the final turn response.
+        Progress/streaming messages are silently dropped — we only deliver the
+        final turn response, either via callback URL (async mode) or by resolving
+        the waiting Future (sync mode).
         """
         if msg.metadata.get("_progress"):
             return
@@ -107,6 +118,23 @@ class SpoekHttpChannel(BaseChannel):
             logger.warning("spoek_http: OutboundMessage missing _request_id, dropping")
             return
 
+        callback_url = msg.metadata.get("_callback_url")
+        if callback_url:
+            # Async mode: POST the response back to the caller.
+            try:
+                async with httpx.AsyncClient() as client:
+                    await client.post(
+                        callback_url,
+                        json={"request_id": request_id, "response": msg.content or ""},
+                        timeout=10.0,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "spoek_http: callback failed for request_id={}: {}", request_id, exc
+                )
+            return
+
+        # Sync mode: resolve the pending Future so the blocked HTTP handler returns.
         future = self._pending.pop(request_id, None)
         if future and not future.done():
             future.set_result(msg.content or "")
@@ -171,13 +199,18 @@ class SpoekHttpChannel(BaseChannel):
         try:
             payload = json.loads(body)
         except json.JSONDecodeError:
+            logger.warning("spoek_http: invalid json body: {!r}", body)
             self._write_http(writer, 400, {"error": "invalid json"})
             return
 
+        callback_url: str | None = payload.get("callback_url")
         request_id = str(uuid.uuid4())
-        loop = asyncio.get_event_loop()
-        future: asyncio.Future = loop.create_future()
-        self._pending[request_id] = future
+
+        if not callback_url:
+            # Sync mode: create a Future the send() method will resolve.
+            loop = asyncio.get_event_loop()
+            future: asyncio.Future = loop.create_future()
+            self._pending[request_id] = future
 
         await self._handle_message(
             sender_id=str(payload.get("from_user_id", "unknown")),
@@ -187,9 +220,16 @@ class SpoekHttpChannel(BaseChannel):
                 "from_user_name": payload.get("from_user_name", ""),
                 "from_user_id": str(payload.get("from_user_id", "")),
                 "_request_id": request_id,
+                "_callback_url": callback_url,
             },
         )
 
+        if callback_url:
+            # Async mode: return immediately; send() will POST to callback_url.
+            self._write_http(writer, 202, {"request_id": request_id})
+            return
+
+        # Sync mode: block until agent responds or timeout.
         try:
             response_text = await asyncio.wait_for(
                 future, timeout=self.config.timeout
@@ -208,7 +248,7 @@ class SpoekHttpChannel(BaseChannel):
     @staticmethod
     def _write_http(writer: asyncio.StreamWriter, status: int, body: dict) -> None:
         payload = json.dumps(body).encode("utf-8")
-        reason = {200: "OK", 400: "Bad Request", 404: "Not Found"}.get(status, "Error")
+        reason = {200: "OK", 202: "Accepted", 400: "Bad Request", 404: "Not Found"}.get(status, "Error")
         header = (
             f"HTTP/1.1 {status} {reason}\r\n"
             f"Content-Type: application/json\r\n"
