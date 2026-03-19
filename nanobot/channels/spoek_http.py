@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import uuid
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ class SpoekHttpConfig:
     def __init__(self, config: dict):
         self.enabled: bool = config.get("enabled", False)
         self.socket_path: str = config.get("socketPath", "/tmp/spoek.sock")
+        self.tcp_port: int = int(config.get("tcpPort", 18791))
         self.allow_from: list[str] = config.get("allowFrom", ["*"])
         self.timeout: float = float(config.get("timeout", 60.0))
 
@@ -64,18 +66,25 @@ class SpoekHttpChannel(BaseChannel):
 
     async def start(self) -> None:
         self._running = True
-        socket_path = self.config.socket_path
 
-        # Remove a stale socket file left by a previous process
-        try:
-            Path(socket_path).unlink()
-        except FileNotFoundError:
-            pass
+        if sys.platform == "win32":
+            port = self.config.tcp_port
+            self._server = await asyncio.start_server(
+                self._handle_connection, host="127.0.0.1", port=port
+            )
+            logger.info("spoek_http: listening on tcp://127.0.0.1:{} (Windows fallback)", port)
+        else:
+            socket_path = self.config.socket_path
+            # Remove a stale socket file left by a previous process
+            try:
+                Path(socket_path).unlink()
+            except FileNotFoundError:
+                pass
+            self._server = await asyncio.start_unix_server(
+                self._handle_connection, path=socket_path
+            )
+            logger.info("spoek_http: listening on unix:{}", socket_path)
 
-        self._server = await asyncio.start_unix_server(
-            self._handle_connection, path=socket_path
-        )
-        logger.info("spoek_http: listening on unix:{}", socket_path)
         async with self._server:
             await self._server.serve_forever()
 
