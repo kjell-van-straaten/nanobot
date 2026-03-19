@@ -171,7 +171,45 @@ class SpoekHttpChannel(BaseChannel):
 
             # Locate the body (after the blank line separating headers from body)
             body_start = request.find("\r\n\r\n")
-            body = request[body_start + 4:] if body_start >= 0 else ""
+            headers_part = request[:body_start] if body_start >= 0 else ""
+            raw_body = request[body_start + 4:] if body_start >= 0 else ""
+
+            # Determine Content-Length from headers
+            content_length: int | None = None
+            for header_line in headers_part.splitlines():
+                if header_line.lower().startswith("content-length:"):
+                    try:
+                        content_length = int(header_line.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+
+            # If body is shorter than Content-Length, read the remainder
+            if content_length is not None:
+                remaining = content_length - len(raw_body.encode("utf-8"))
+                if remaining > 0:
+                    extra = await reader.read(remaining)
+                    raw_body += extra.decode("utf-8", errors="replace")
+
+            # Strip chunked transfer encoding framing if present
+            is_chunked = any(
+                "transfer-encoding: chunked" in line.lower()
+                for line in headers_part.splitlines()
+            )
+            if is_chunked:
+                unchunked = []
+                chunk_data = raw_body
+                while chunk_data:
+                    crlf = chunk_data.find("\r\n")
+                    if crlf < 0:
+                        break
+                    size = int(chunk_data[:crlf], 16)
+                    if size == 0:
+                        break
+                    unchunked.append(chunk_data[crlf + 2 : crlf + 2 + size])
+                    chunk_data = chunk_data[crlf + 2 + size + 2:]
+                raw_body = "".join(unchunked)
+
+            body = raw_body
 
             if method == "GET" and path == "/health":
                 self._write_http(writer, 200, {"status": "ok"})
