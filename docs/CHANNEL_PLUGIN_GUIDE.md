@@ -197,8 +197,33 @@ class OutboundMessage:
     chat_id: str        # recipient (same value you passed to _handle_message)
     content: str        # markdown text — convert to platform format as needed
     media: list[str]    # local file paths to attach (images, audio, docs)
-    metadata: dict      # may contain: "_progress" (bool) for streaming chunks,
-                        #              "message_id" for reply threading
+    metadata: dict      # well-known keys:
+                        #   "_progress" (bool)    — streaming chunk, not a final reply
+                        #   "message_id" (str)    — reply threading hint
+                        #   "_request_id" (str)   — set by spoek_http to correlate
+                        #                           async responses with waiting futures
+                        #   "_callback_url" (str) — set by spoek_http for fire-and-forget
+                        #                           mode; send() POSTs the response here
+```
+
+**Unsolicited / push messages** (e.g. from cron jobs) arrive in `send()` with no
+`_request_id` and no `_callback_url`. Handle these by delivering out-of-band — for
+example, POSTing to a configured `pushUrl`:
+
+```python
+async def send(self, msg: OutboundMessage) -> None:
+    request_id = msg.metadata.get("_request_id")
+    if not request_id:
+        # Unsolicited push — deliver via a configured push endpoint
+        if self.config.get("pushUrl") and msg.chat_id and msg.content:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    self.config["pushUrl"],
+                    json={"chat_id": msg.chat_id, "text": msg.content},
+                    timeout=10.0,
+                )
+        return
+    # … normal request/response handling …
 ```
 
 ## Config

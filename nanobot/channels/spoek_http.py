@@ -4,7 +4,7 @@ This channel replaces nanobot's native per-bot Telegram integration for the Spoe
 deployment model, where one shared @SpoekBot handles all groups and the FastAPI
 dispatcher routes messages to per-Spoek nanobot processes via Unix socket.
 
-Two modes:
+Three modes:
 
 Synchronous (default):
     FastAPI dispatcher  →  POST /message (no callback_url)
@@ -17,6 +17,15 @@ Async/callback (fire-and-forget):
                            … agent processes in background …
                         →  POST callback_url {"request_id": "...", "response": "..."}
                         →  FastAPI dispatcher sends reply via Telegram
+
+Push / unsolicited (cron, heartbeat):
+    Agent (no inbound request)  →  OutboundMessage(channel="spoek_http", chat_id=..., content=...)
+    spoek_http.send()           →  POST pushUrl {"chat_id": "...", "text": "..."}
+                                →  FastAPI POST /internal/push-message
+                                →  send reply via shared Telegram bot token
+
+    Requires "pushUrl" in channel config, set to {API_BASE_URL}/internal/push-message.
+    Automatically populated from the {{API_BASE_URL}} template variable at spawn time.
 """
 
 from __future__ import annotations
@@ -116,7 +125,23 @@ class SpoekHttpChannel(BaseChannel):
 
         request_id = msg.metadata.get("_request_id")
         if not request_id:
-            logger.warning("spoek_http: OutboundMessage missing _request_id, dropping")
+            # Unsolicited push (e.g. cron): deliver via pushUrl if configured.
+            push_url = self.config.get("pushUrl")
+            if push_url and msg.chat_id and msg.content:
+                try:
+                    async with httpx.AsyncClient() as client:
+                        await client.post(
+                            push_url,
+                            json={"chat_id": msg.chat_id, "text": msg.content},
+                            timeout=10.0,
+                        )
+                except Exception as exc:
+                    logger.warning("spoek_http: push failed for chat_id={}: {}", msg.chat_id, exc)
+            else:
+                logger.warning(
+                    "spoek_http: no pushUrl configured, dropping unsolicited message for chat_id={}",
+                    msg.chat_id,
+                )
             return
 
         callback_url = msg.metadata.get("_callback_url")
@@ -133,22 +158,6 @@ class SpoekHttpChannel(BaseChannel):
                 logger.warning(
                     "spoek_http: callback failed for request_id={}: {}", request_id, exc
                 )
-            return
-
-        if not request_id:
-            # Unsolicited push (e.g. cron): deliver via pushUrl if configured.
-            if self.config.push_url and msg.chat_id and msg.content:
-                try:
-                    async with httpx.AsyncClient() as client:
-                        await client.post(
-                            self.config.push_url,
-                            json={"chat_id": msg.chat_id, "text": msg.content},
-                            timeout=10.0,
-                        )
-                except Exception as exc:
-                    logger.warning("spoek_http: push failed for chat_id={}: {}", msg.chat_id, exc)
-            else:
-                logger.warning("spoek_http: no pushUrl configured, dropping unsolicited message for chat_id={}", msg.chat_id)
             return
 
         # Sync mode: resolve the pending Future so the blocked HTTP handler returns.
