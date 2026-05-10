@@ -961,8 +961,11 @@ def _run_gateway(
             tasks = [
                 agent.run(),
                 channels.start_all(),
-                _health_server(config.gateway.host, port),
             ]
+            # Spoek: --port 0 disables the built-in HTTP health endpoint so
+            # multiple gateways can share a host without colliding on 18790.
+            if port and port > 0:
+                tasks.append(_health_server(config.gateway.host, port))
             if open_browser_url:
                 tasks.append(_open_browser_when_ready())
             await asyncio.gather(*tasks)
